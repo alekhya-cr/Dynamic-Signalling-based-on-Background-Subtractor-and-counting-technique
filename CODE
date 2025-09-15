@@ -1,0 +1,135 @@
+import cv2
+import numpy as np
+import time
+
+# Define constants
+TRAFFIC_LIGHT_WIDTH, TRAFFIC_LIGHT_HEIGHT = 200, 500
+COUNT_LINE_POSITION = 550
+MIN_WIDTH_REACT, MIN_HEIGHT_REACT = 80, 80
+
+# Signal timing limits
+MAX_GREEN_TIME = 60
+MIN_GREEN_TIME = 10
+YELLOW_TIMING = 5
+RED_TIME = 30
+
+# Video file names for four lanes
+video_files = ['PROJ.mp4', 'numberofvehicles.webm', 'PROJ.mp4', 'EMPTYROAD.webm']
+
+# Initialize video capture for four lanes
+caps = [cv2.VideoCapture(video) for video in video_files]
+
+# Load YOLOv3 model and COCO class labels
+net = cv2.dnn.readNet('yolov3.weights', 'yolov3.cfg')
+layer_names = net.getLayerNames()
+output_layers = [layer_names[i - 1] for i in net.getUnconnectedOutLayers()]
+
+# Vehicle counting variables for each lane
+detect_lanes = [[], [], [], []]  # For four lanes
+counters = [0, 0, 0, 0]  # Vehicle counters for each lane
+offset = 6
+
+# Traffic light states and timing control for each lane
+signal_states = ["green", "red", "red", "red"]  # Initial states, only lane 1 is green
+last_switch_times = [time.time() for _ in range(4)]  # Correct initialization
+
+# Function to determine the center of a bounding box
+def center_handle(x, y, w, h):
+    return x + w // 2, y + h // 2
+
+# Function to dynamically update green time based on vehicle count
+def update_green_time(vehicle_count):
+    return min(MAX_GREEN_TIME, max(MIN_GREEN_TIME, 10 + vehicle_count * 2))
+
+# Create an empty traffic light image
+traffic_light = np.zeros((TRAFFIC_LIGHT_HEIGHT, TRAFFIC_LIGHT_WIDTH, 3), dtype=np.uint8)
+
+# Function to restart a video if it ends
+def restart_video(cap, video_file):
+    cap.release()
+    return cv2.VideoCapture(video_file)
+
+# Main processing loop
+while True:
+    frames = []
+    for i, cap in enumerate(caps):
+        ret, frame = cap.read()
+        if not ret:
+            print(f"Restarting video for lane {i+1}.")
+            caps[i] = restart_video(caps[i], video_files[i])
+            ret, frame = caps[i].read()
+        frames.append(frame)
+
+    for i in range(4):
+        # Apply YOLOv3 object detection
+        blob = cv2.dnn.blobFromImage(frames[i], 0.00392, (416, 416), (0, 0, 0), True, crop=False)
+        net.setInput(blob)
+        layer_outputs = net.forward(output_layers)
+
+        # Process YOLO outputs
+        detect_lanes[i].clear()
+        for output in layer_outputs:
+            for detection in output:
+                scores = detection[5:]
+                class_id = np.argmax(scores)
+                confidence = scores[class_id]
+                if confidence > 0.5:  # Threshold for vehicle detection
+                    center_x = int(detection[0] * frames[i].shape[1])
+                    center_y = int(detection[1] * frames[i].shape[0])
+                    w = int(detection[2] * frames[i].shape[1])
+                    h = int(detection[3] * frames[i].shape[0])
+
+                    # Check if the detection is a vehicle (class_id for car in COCO dataset is 2)
+                    if class_id == 2:  # Car class ID in COCO
+                        center = center_handle(center_x - w // 2, center_y - h // 2, w, h)
+                        detect_lanes[i].append(center)
+                        cv2.rectangle(frames[i], (center_x - w // 2, center_y - h // 2), (center_x + w // 2, center_y + h // 2), (0, 255, 0), 2)
+                        cv2.circle(frames[i], center, 4, (0, 0, 255), -1)
+
+        # Count vehicles that cross the detection line
+        detect_lanes[i] = [d for d in detect_lanes[i] if COUNT_LINE_POSITION - offset < d[1] < COUNT_LINE_POSITION + offset]
+        counters[i] += len(detect_lanes[i])
+
+        # Traffic light state control
+        current_time = time.time()
+        elapsed_time = current_time - last_switch_times[i]
+        green_time = update_green_time(counters[i])
+
+        if signal_states[i] == "green" and elapsed_time >= green_time:
+            signal_states[i] = "yellow"
+            last_switch_times[i] = current_time
+        elif signal_states[i] == "yellow" and elapsed_time >= YELLOW_TIMING:
+            signal_states[i] = "red"
+            last_switch_times[i] = current_time
+            next_lane = (i + 1) % 4
+            signal_states[next_lane] = "green"
+            last_switch_times[next_lane] = current_time
+
+        cv2.putText(frames[i], f"Lane {i+1} Count: {counters[i]}", (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+
+    # Display the frames and traffic lights
+    for i in range(4):
+        lane_light = traffic_light.copy()
+        if signal_states[i] == "green":
+            cv2.circle(lane_light, (100, 150), 50, (0, 255, 0), -1)
+        elif signal_states[i] == "yellow":
+            cv2.circle(lane_light, (100, 300), 50, (0, 255, 255), -1)
+        else:
+            cv2.circle(lane_light, (100, 450), 50, (0, 0, 255), -1)
+
+        cv2.putText(lane_light, f"Lane {i+1}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+        cv2.putText(lane_light, f"Green Time: {update_green_time(counters[i])}s", (10, 400), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        cv2.putText(lane_light, f"Yellow Time: {YELLOW_TIMING}s", (10, 420), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        cv2.putText(lane_light, f"Red Time: {RED_TIME}s", (10, 440), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+
+        cv2.imshow(f'Traffic Light - Lane {i+1}', lane_light)
+        cv2.imshow(f'Vehicle Detection - Lane {i+1}', frames[i])
+
+    # Exit on 'q'
+    if cv2.waitKey(1) & 0xFF == ord('q'):
+        break
+
+# Cleanup resources
+for cap in caps:
+    cap.release()
+cv2.destroyAllWindows()
